@@ -1,40 +1,66 @@
 # Agent Runtime Dashboard
 
-Local macOS-first dashboard for discovering developer projects, their running
-processes, listening ports, and optional start/open actions.
+本地 macOS 开发者工具：让可用的 Agent CLI 自己报告项目与端口，再由仪表盘按规范化文件路径去重，并用本机运行时信息核对哪些项目正在运行。
 
-## Run
+[English README](README.en.md)
+
+## 功能
+
+- 启动时为每个可调用的 Agent CLI 建立一次只读发现会话。
+- 展示 Agent 报告的项目路径、运行状态、已知端口和端口 URL。
+- 通过当前进程的 cwd、父进程和 LISTEN socket 核对运行中的项目。
+- 将无法安全归属到项目的监听端口单独列出，不静默丢弃。
+- 从项目自身的 `package.json` 启动 `dev`、`start` 或 `serve` 脚本。
+- 一键打开已知的本地网页；浏览器不能提交任意 shell 命令。
+
+## 工作方式
+
+项目发现的权威来源是 Agent CLI 会话，而不是递归扫描磁盘：
+
+1. Dashboard 检查支持的 CLI 是否存在于当前 `PATH`。
+2. 每个可用 CLI 收到只读提示，使用它自己的项目/会话索引和运行时证据返回结构化 JSON。
+3. Dashboard 以规范化绝对路径合并重复项目和重复端口。
+4. 本机只负责核对当前 LISTEN socket 与进程 cwd，不把任意目录猜成项目。
+
+当前内置调用适配器为 `codex`、`claude` 和 `opencode`。只有实际安装、可执行且当前权限可见的 CLI 才会被调用；不存在通用协议可以凭空询问所有未知 Agent。没有 CLI、没有权限或 Agent 自身索引未暴露的项目，不能被诚实地声称为“已发现”。
+
+## 运行
 
 ```bash
 npm install
 npm run dev
 ```
 
-Open <http://127.0.0.1:5173>.
+打开 <http://127.0.0.1:5173>。
 
-The API runs on `127.0.0.1:4317`. Production-style serving is available with:
+API 服务运行在 `127.0.0.1:4317`。也可以使用生产模式：
 
 ```bash
 npm run build
 npm start
 ```
 
-## Project discovery
+## 配置
 
-The default Agent working root is the current user's home directory (`~`). The
-project list comes from read-only Agent CLI inventory sessions, while every
-visible LISTEN socket is checked locally against the returned project paths. A stopped project keeps known ports;
-missing paths and listening ports without readable project ownership are shown
-separately instead of being silently discarded. Add extra roots or explicit
-projects in `config/settings.json` when a project lives outside the home
-directory. A project's `package.json` `dev`, `start`, or `serve` script is shown
-as a start candidate. The Start button only runs a command belonging to the
-discovered project and never accepts a raw command from the browser.
+`config/settings.json` 可添加明确的项目配置：
 
-## Agent CLI
+```json
+{
+  "scanRoots": ["~"],
+  "preferredAgent": "auto",
+  "projects": []
+}
+```
 
-On startup the dashboard starts one read-only inventory session for every
-available `codex`, `claude`, or `opencode` CLI. Each session returns structured
-project paths, observed ports, and evidence; the dashboard normalizes paths and
-merges duplicate reports. The local process/socket scan only verifies current
-runtime ownership and exposes sockets that no Agent could safely attribute.
+`scanRoots` 只用于 Agent 的工作根目录提示和界面显示，不会触发本地递归项目扫描。`projects` 可用于补充 Agent 无法返回、但你明确知道的项目。
+
+## 检查
+
+```bash
+npm run build
+npm run check
+```
+
+## 许可证
+
+当前仓库未声明许可证。
