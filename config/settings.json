@@ -1,0 +1,8 @@
+{
+  "scanRoots": [
+    ".."
+  ],
+  "preferredAgent": "auto",
+  "projects": []
+}
+
