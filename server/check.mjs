@@ -25,9 +25,9 @@ try {
   const state = await response.json();
   assert(Array.isArray(state.projects), 'state.projects must be an array');
   assert(Array.isArray(state.availableAgents), 'state.availableAgents must be an array');
+  assert(Array.isArray(state.unassignedPorts), 'state.unassignedPorts must be an array');
   assert(typeof state.generatedAt === 'string', 'state.generatedAt must be a timestamp');
   console.log(`check ok: ${state.projects.length} projects discovered`);
 } finally {
   server.kill('SIGTERM');
 }
-

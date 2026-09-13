@@ -7,7 +7,7 @@ No upstream source files are copied into this repository.
 
 | Project | Source | License | Use | Attribution / condition |
 | --- | --- | --- | --- | --- |
-| AgentHUD | https://github.com/neochoon/agenthud | MIT declared in README and package.json; the checked GitHub checkout did not contain a LICENSE file | Optional child-process integration via `agenthud follow --json` | Confirm the distributed license before shipping; keep MIT notice if used |
+| AgentHUD | https://github.com/neochoon/agenthud | MIT declared in README and package.json; the checked GitHub checkout did not contain a LICENSE file | Design reference only | Confirm the distributed license before shipping if added |
 | AgentMonitor | https://github.com/jiweiyeah/AgentMonitor | MIT | Design reference only | No source copied |
 | yunhaoli24/codex-gateway | https://github.com/yunhaoli24/codex-gateway | MIT | Design reference only | No source copied |
 | AgentMeter | https://github.com/LyleMi/AgentMeter | Apache-2.0 | Design reference only | No source copied |
@@ -16,7 +16,7 @@ No upstream source files are copied into this repository.
 
 ## Current decision
 
-The first implementation uses `systeminformation` as an npm dependency. AgentHUD
-and other Agent CLIs are optional runtime integrations and are not required for
-the deterministic process/port scan.
-
+The current implementation asks each available supported Agent CLI to return a
+read-only structured inventory. `systeminformation` is retained only to verify
+current listening sockets and process cwd/parent ownership. No upstream source
+files are copied into the repository.

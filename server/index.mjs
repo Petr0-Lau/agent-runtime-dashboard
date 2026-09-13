@@ -1,7 +1,7 @@
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,33 +13,11 @@ const configPath = path.join(appRoot, 'config/settings.json');
 const stateDir = path.join(os.homedir(), '.agent-runtime-dashboard');
 const statePath = path.join(stateDir, 'state.json');
 const port = Number(process.env.PORT || 4317);
-const ignoredDirectories = new Set([
-  '.git',
-  '.next',
-  '.nuxt',
-  '.turbo',
-  '.vite',
-  'build',
-  'coverage',
-  'dist',
-  'node_modules',
-  'target',
-]);
-const projectMarkers = [
-  'package.json',
-  'pyproject.toml',
-  'requirements.txt',
-  'Cargo.toml',
-  'go.mod',
-  'docker-compose.yml',
-  'docker-compose.yaml',
-  'compose.yml',
-  'compose.yaml',
-  'Makefile',
-];
-const runtimePattern = /\b(node|npm|pnpm|yarn|bun|vite|next|python|uvicorn|gunicorn|flask|django|java|docker|redis|postgres|postmaster|mysql|mysqld|cargo|go|deno|ruby)\b/i;
-const agentNames = ['agenthud', 'codex', 'claude', 'opencode'];
-let lastAgentScan = null;
+const agentNames = ['codex', 'claude', 'opencode'];
+let agentDiscovery = { status: 'idle', startedAt: null, finishedAt: null, reports: [], errors: [] };
+let agentInventory = new Map();
+let agentUnassignedPorts = [];
+let agentScanPromise = null;
 
 const json = (value) => JSON.stringify(value, null, 2);
 
@@ -52,11 +30,11 @@ async function readJson(file, fallback) {
 }
 
 async function settings() {
-  return readJson(configPath, { scanRoots: ['..'], preferredAgent: 'auto', projects: [] });
+  return readJson(configPath, { scanRoots: ['~'], preferredAgent: 'auto', projects: [] });
 }
 
 async function storedState() {
-  return readJson(statePath, { projects: {} });
+  return readJson(statePath, { projects: {}, agentInventory: [], agentUnassignedPorts: [] });
 }
 
 function projectId(projectPath) {
@@ -64,42 +42,13 @@ function projectId(projectPath) {
 }
 
 function absoluteFromApp(value) {
-  return path.isAbsolute(value) ? path.normalize(value) : path.resolve(appRoot, value);
-}
-
-async function isDirectory(directory) {
-  try {
-    return (await stat(directory)).isDirectory();
-  } catch {
-    return false;
+  const raw = String(value || '');
+  if (raw.startsWith('file://')) {
+    try { return path.normalize(fileURLToPath(raw)); } catch { return raw; }
   }
-}
-
-async function hasProjectMarker(directory) {
-  for (const marker of projectMarkers) {
-    if (existsSync(path.join(directory, marker))) return true;
-  }
-  return false;
-}
-
-async function findProjectDirectories(root, depth = 0) {
-  if (!(await isDirectory(root)) || depth > 2) return [];
-  const matches = [];
-  if (await hasProjectMarker(root)) matches.push(root);
-  if (depth === 2) return matches;
-
-  let entries = [];
-  try {
-    entries = await readdir(root, { withFileTypes: true });
-  } catch {
-    return matches;
-  }
-
-  for (const entry of entries) {
-    if (!entry.isDirectory() || ignoredDirectories.has(entry.name) || entry.name.startsWith('.')) continue;
-    matches.push(...await findProjectDirectories(path.join(root, entry.name), depth + 1));
-  }
-  return matches;
+  if (raw === '~') return os.homedir();
+  if (raw.startsWith('~/')) return path.join(os.homedir(), raw.slice(2));
+  return path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(appRoot, raw);
 }
 
 function packageManager(projectPath) {
@@ -109,14 +58,6 @@ function packageManager(projectPath) {
   return 'npm';
 }
 
-function portHints(text) {
-  const ports = new Set();
-  for (const match of String(text || '').matchAll(/(?:--port|-p)\s*(?:=|\s)\s*(\d{2,5})\b/gi)) ports.add(Number(match[1]));
-  for (const match of String(text || '').matchAll(/\bPORT\s*=\s*(\d{2,5})\b/gi)) ports.add(Number(match[1]));
-  for (const match of String(text || '').matchAll(/\bport\s*:\s*(\d{2,5})\b/gi)) ports.add(Number(match[1]));
-  return [...ports].filter((value) => value >= 1 && value <= 65535);
-}
-
 function normalizeConfiguredPorts(ports) {
   return (Array.isArray(ports) ? ports : [])
     .map((item) => typeof item === 'number' ? { port: item, source: 'settings' } : item)
@@ -124,50 +65,196 @@ function normalizeConfiguredPorts(ports) {
     .map((item) => ({ port: Number(item.port), source: item.source || 'settings', protocol: item.protocol || 'http' }));
 }
 
-async function projectInfo(projectPath, configProject = {}) {
+function normalizeAgentPorts(ports) {
+  return (Array.isArray(ports) ? ports : [])
+    .map((item) => typeof item === 'number' ? { port: item } : item)
+    .filter((item) => Number.isInteger(Number(item?.port)) && Number(item.port) > 0 && Number(item.port) <= 65535)
+    .map((item) => ({
+      port: Number(item.port),
+      protocol: item.protocol || 'tcp',
+      address: item.address || '*',
+      url: item.url || localUrl(item.address, Number(item.port)),
+      running: Boolean(item.running),
+      source: item.source || 'Agent CLI',
+      pid: Number(item.pid) || null,
+      process: item.process || null,
+    }));
+}
+
+async function projectInfo(projectPath, configProject = {}, agentProject = null, sources = []) {
   const packageJson = await readJson(path.join(projectPath, 'package.json'), null);
   const scripts = packageJson?.scripts || {};
   const scriptName = ['dev', 'start', 'serve'].find((name) => typeof scripts[name] === 'string');
   const configuredStart = typeof configProject.startCommand === 'string' && configProject.startCommand.trim();
   const startCommand = configuredStart || (scriptName ? `${packageManager(projectPath)} run ${scriptName}` : null);
-  const scriptText = Object.values(scripts).join(' ');
   const configuredPorts = normalizeConfiguredPorts(configProject.ports);
-  const configText = (await Promise.all(['vite.config.js', 'vite.config.ts', 'vite.config.mjs', 'next.config.js', 'next.config.mjs', '.env', '.env.local'].map(async (file) => {
-    try { return await readFile(path.join(projectPath, file), 'utf8'); } catch { return ''; }
-  }))).join('\n');
-  const explicitHints = portHints(`${scriptText}\n${configText}`);
-  const hintedPorts = explicitHints.map((port) => ({ port, source: configText.includes(String(port)) ? 'project config' : 'package.json', protocol: 'http' }));
-  const dependencies = { ...(packageJson?.dependencies || {}), ...(packageJson?.devDependencies || {}) };
-  if (!configuredPorts.length && !hintedPorts.length) {
-    const frameworkDefault = dependencies.vite ? 5173 : dependencies.next ? 3000 : dependencies['react-scripts'] ? 3000 : null;
-    if (frameworkDefault) hintedPorts.push({ port: frameworkDefault, source: 'framework default', protocol: 'http' });
-  }
   const name = configProject.name || packageJson?.name || path.basename(projectPath);
 
   return {
     id: projectId(projectPath),
     name,
     path: projectPath,
+    agents: agentProject ? [...new Set(agentProject.agents)].sort() : [],
+    sessionCount: agentProject?.sessionCount || 0,
+    agentLastSeen: agentProject?.lastSeen || null,
+    agentStatus: agentProject?.status || null,
+    reportedPorts: normalizeAgentPorts(agentProject?.ports),
+    evidence: agentProject?.evidence || [],
+    sources: [...new Set(sources)],
     package: packageJson ? { name: packageJson.name || null, scripts: Object.keys(scripts) } : null,
     configuredPorts,
-    hintedPorts,
     openUrl: configProject.openUrl || null,
     start: startCommand ? { enabled: true, command: startCommand, source: configuredStart ? 'settings' : 'package.json' } : { enabled: false, command: null, source: null },
   };
 }
 
-async function discoverProjects(config) {
-  const paths = new Set();
-  for (const root of Array.isArray(config.scanRoots) ? config.scanRoots : []) {
-    for (const projectPath of await findProjectDirectories(absoluteFromApp(root))) paths.add(path.normalize(projectPath));
+async function canonicalProjectPath(value) {
+  const projectPath = absoluteFromApp(value);
+  if (!path.isAbsolute(projectPath) || projectPath === path.parse(projectPath).root || projectPath === os.homedir()) return null;
+  try { return await realpath(projectPath); } catch { return path.normalize(projectPath); }
+}
+
+function parseJsonObject(text) {
+  const value = String(text || '').replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+  for (const candidate of [value, value.slice(value.indexOf('{'), value.lastIndexOf('}') + 1)]) {
+    if (!candidate || !candidate.startsWith('{')) continue;
+    try { return JSON.parse(candidate); } catch { /* Agent may have added a short preamble. */ }
   }
+  return null;
+}
+
+async function normalizeAgentReport(report, agent, finishedAt) {
+  const projects = [];
+  for (const item of Array.isArray(report?.projects) ? report.projects : []) {
+    const projectPath = await canonicalProjectPath(item?.path || item?.cwd || item?.projectPath);
+    if (!projectPath) continue;
+    const ports = normalizeAgentPorts(item.ports);
+    const status = ['running', 'stopped', 'missing'].includes(item.status)
+      ? item.status
+      : ports.some((port) => port.running) ? 'running' : existsSync(projectPath) ? 'stopped' : 'missing';
+    projects.push({
+      path: projectPath,
+      name: item.name || path.basename(projectPath),
+      agents: [agent],
+      sessionCount: Number(item.sessionCount) || 1,
+      lastSeen: item.lastSeen || finishedAt,
+      status,
+      ports,
+      evidence: Array.isArray(item.evidence) ? item.evidence.filter(Boolean).slice(0, 12) : [],
+    });
+  }
+  return {
+    projects,
+    unassignedPorts: normalizeAgentPorts(report?.unassignedPorts),
+  };
+}
+
+function mergeAgentInventory(results) {
+  const projects = new Map();
+  const unassigned = new Map();
+  for (const result of results) {
+    for (const item of result.inventory.projects) {
+      const current = projects.get(item.path) || { ...item, agents: [], ports: [] };
+      current.agents = [...new Set([...current.agents, ...item.agents])];
+      current.sessionCount += item.sessionCount;
+      if (!current.lastSeen || item.lastSeen > current.lastSeen) current.lastSeen = item.lastSeen;
+      if (current.status !== 'running' && item.status === 'running') current.status = 'running';
+      if (current.status === 'missing' && item.status !== 'missing') current.status = item.status;
+      current.evidence = [...new Set([...current.evidence, ...item.evidence])].slice(0, 12);
+      current.ports.push(...item.ports);
+      projects.set(item.path, current);
+    }
+    for (const port of result.inventory.unassignedPorts) {
+      const key = `${port.pid || ''}:${port.address}:${port.port}`;
+      unassigned.set(key, port);
+    }
+  }
+  for (const item of projects.values()) item.ports = uniquePortRows(item.ports);
+  return { projects, unassignedPorts: [...unassigned.values()] };
+}
+
+const agentPrompt = (agent) => `Start a fresh read-only local inventory session as ${agent}. Independently discover the local coding-agent projects and their ports for the current user on this Mac.
+
+Use your own Agent project/session index or metadata first; do not recursively read raw session transcripts, crawl arbitrary home-directory files, invoke another Agent, or dump large command outputs into your context. Use no more than five read-only shell commands and do not retry failed command variants. Then verify only candidate project roots and current process/socket ownership. Inspect project manifests only when needed to identify an explicit stopped port. Do not rely on this dashboard's previous output. Do not modify files, install anything, start or stop processes, read source code or secrets, or assume a directory is a project from its name alone.
+
+Return ONLY one JSON object, with this exact shape and no markdown:
+{"projects":[{"path":"/absolute/project/root","name":"name","status":"running|stopped|missing","ports":[{"port":5173,"url":"http://127.0.0.1:5173","running":true,"pid":123,"process":"node","evidence":"why this port belongs to this project"}],"evidence":["how the project was found"]}],"unassignedPorts":[{"port":1234,"url":"http://127.0.0.1:1234","running":true,"pid":123,"process":"node","evidence":"why ownership is unknown"}],"notes":["optional limitations"]}
+
+Rules: path must be an absolute project/workspace root, not an Agent cache, plugin, skill, session, log, or config directory; include stopped projects learned from Agent metadata and mark deleted ones as missing; include a port only when you observed it in a process/socket or an explicit project configuration; tie a running port to a project only with process cwd/parent-process or equivalent evidence; otherwise put it in unassignedPorts. Deduplicate paths yourself before returning. Finish promptly; if an index or ownership check is unavailable, return the verified partial result with a note instead of waiting indefinitely.`;
+
+function agentCommand(agent, prompt, root) {
+  if (agent.name === 'codex') return ['--ask-for-approval', 'never', 'exec', '--ignore-user-config', '--json', '--ephemeral', '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', root, prompt];
+  if (agent.name === 'claude') return ['-p', prompt, '--output-format', 'text'];
+  return ['run', prompt];
+}
+
+async function runOneAgent(agent, root) {
+  const startedAt = new Date().toISOString();
+  try {
+    const result = await spawnFileText(agent.path, agentCommand(agent, agentPrompt(agent.name), root), { cwd: root, timeout: 180000, env: agentEnvironment() });
+    const parsed = extractAgentText(result.stdout);
+    const report = parseJsonObject(parsed.text);
+    if (!report) throw new Error('Agent CLI 没有返回可解析的 JSON inventory');
+    const finishedAt = new Date().toISOString();
+    const inventory = await normalizeAgentReport(report, agent.name, finishedAt);
+    return {
+      summary: { status: 'ok', agent: agent.name, path: agent.path, startedAt, finishedAt, projectCount: inventory.projects.length, unassignedPortCount: inventory.unassignedPorts.length, text: parsed.text.slice(-12000) },
+      inventory,
+    };
+  } catch (error) {
+    return { summary: { status: 'error', agent: agent.name, path: agent.path, startedAt, finishedAt: new Date().toISOString(), message: error.message, output: String(error.stdout || error.stderr || '').slice(-4000) }, inventory: { projects: [], unassignedPorts: [] } };
+  }
+}
+
+async function runAgentScans() {
+  const config = await settings();
+  const root = absoluteFromApp(config.scanRoots?.[0] || '~');
+  const agents = (await availableAgents()).filter((agent) => agent.path);
+  if (!agents.length) {
+    return { summaries: [{ status: 'unavailable', message: '没有检测到可执行的 codex、claude 或 opencode CLI。' }], inventory: { projects: new Map(), unassignedPorts: [] } };
+  }
+  const results = await Promise.all(agents.map((agent) => runOneAgent(agent, root)));
+  return { summaries: results.map((result) => result.summary), inventory: mergeAgentInventory(results) };
+}
+
+function startAgentDiscovery(force = false) {
+  if (agentScanPromise) return agentScanPromise;
+  if (!force && agentDiscovery.status !== 'idle') return Promise.resolve(agentDiscovery);
+  const startedAt = new Date().toISOString();
+  agentDiscovery = { status: 'running', startedAt, finishedAt: null, reports: [], errors: [] };
+  agentScanPromise = runAgentScans().then((result) => {
+    if (result.summaries.some((summary) => summary.status === 'ok')) {
+      agentInventory = result.inventory.projects;
+      agentUnassignedPorts = result.inventory.unassignedPorts;
+    }
+    agentDiscovery = {
+      status: result.summaries.some((summary) => summary.status === 'ok') ? 'ok' : result.summaries.some((summary) => summary.status === 'error') ? 'error' : 'unavailable',
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      reports: result.summaries,
+      errors: result.summaries.filter((summary) => summary.status === 'error').map((summary) => `${summary.agent}: ${summary.message}`),
+    };
+    return agentDiscovery;
+  }).catch((error) => {
+    agentDiscovery = { status: 'error', startedAt, finishedAt: new Date().toISOString(), reports: [], errors: [error.message] };
+    return agentDiscovery;
+  }).finally(() => { agentScanPromise = null; });
+  return agentScanPromise;
+}
+
+async function discoverProjects(config) {
+  const paths = new Map();
   const configured = Array.isArray(config.projects) ? config.projects : [];
   for (const item of configured) {
-    if (typeof item === 'string') paths.add(absoluteFromApp(item));
-    else if (item?.path) paths.add(absoluteFromApp(item.path));
+    const configuredPath = typeof item === 'string' ? absoluteFromApp(item) : item?.path ? absoluteFromApp(item.path) : null;
+    if (configuredPath) paths.set(path.normalize(configuredPath), { sources: ['settings'] });
   }
   const configByPath = new Map(configured.filter((item) => item && typeof item === 'object' && item.path).map((item) => [absoluteFromApp(item.path), item]));
-  return Promise.all([...paths].sort().map((projectPath) => projectInfo(projectPath, configByPath.get(projectPath) || {})));
+  for (const [projectPath, agentProject] of agentInventory) {
+    const sources = [...new Set([...(paths.get(projectPath)?.sources || []), ...agentProject.agents.map((agent) => `agent:${agent}`)])];
+    paths.set(projectPath, { sources });
+  }
+  return Promise.all([...paths.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([projectPath, meta]) => projectInfo(projectPath, configByPath.get(projectPath) || {}, agentInventory.get(projectPath) || null, meta.sources)));
 }
 
 function execFileText(command, args, options = {}) {
@@ -251,7 +338,7 @@ function agentEnvironment() {
     'CODEX_MCP_NODE_PATH',
     'CODEX_INTERNAL_ORIGINATOR_OVERRIDE',
   ]);
-  return Object.fromEntries(Object.entries(process.env).filter(([key]) => !inheritedSessionKeys.has(key)));
+  return { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !inheritedSessionKeys.has(key))), PATH: [process.env.PATH, '/usr/bin', '/bin', '/usr/sbin', '/sbin'].filter(Boolean).join(':') };
 }
 
 async function processCwd(pid) {
@@ -298,7 +385,20 @@ function belongs(cwd, projectPath) {
 function localUrl(address, portNumber) {
   if (!portNumber) return null;
   const host = !address || address === '*' || address === '0.0.0.0' || address === '::' || address === 'localhost' ? '127.0.0.1' : address;
-  return `http://${host}:${portNumber}`;
+  const displayHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+  return `http://${displayHost}:${portNumber}`;
+}
+
+async function runtimeProjectRoot(cwd) {
+  if (!cwd || !path.isAbsolute(cwd) || cwd === os.homedir() || cwd === path.parse(cwd).root) return null;
+  try {
+    const result = await execFileText('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], { timeout: 1200, maxBuffer: 20000 });
+    const root = result.stdout.trim();
+    if (root && root !== os.homedir() && root !== path.parse(root).root) return path.normalize(root);
+  } catch {
+    if (existsSync(path.join(cwd, 'package.json'))) return path.normalize(cwd);
+  }
+  return null;
 }
 
 async function runtimeSnapshot(projects) {
@@ -320,11 +420,15 @@ async function runtimeSnapshot(projects) {
   const connections = (Array.isArray(connectionResult) ? connectionResult : []).map(normalizeConnection).filter((item) => item.port > 0 && (item.state === 'LISTEN' || item.state === 'LISTENING' || !item.state));
   const processByPid = new Map(processes.map((item) => [item.pid, item]));
   const candidatePids = new Set(connections.map((item) => item.pid).filter(Boolean));
-  for (const item of processes) {
-    if (runtimePattern.test(`${item.name} ${item.command}`)) candidatePids.add(item.pid);
+  for (const pid of [...candidatePids]) {
+    let current = processByPid.get(pid);
+    while (current?.ppid && processByPid.has(current.ppid)) {
+      candidatePids.add(current.ppid);
+      current = processByPid.get(current.ppid);
+    }
   }
   const cwdByPid = new Map();
-  await Promise.all([...candidatePids].slice(0, 180).map(async (pid) => {
+  await Promise.all([...candidatePids].slice(0, 300).map(async (pid) => {
     const cwd = processByPid.get(pid)?.cwd || await processCwd(pid);
     if (cwd) {
       cwdByPid.set(pid, cwd);
@@ -332,21 +436,40 @@ async function runtimeSnapshot(projects) {
     }
   }));
 
+  const runtimePaths = new Set();
+  await Promise.all([...new Set([...cwdByPid.values(), ...processes.map((process) => process.cwd).filter(Boolean)])].map(async (cwd) => {
+    const root = await runtimeProjectRoot(cwd);
+    if (root && !projects.some((project) => project.path === root)) runtimePaths.add(root);
+  }));
+  const candidates = [...projects, ...[...runtimePaths].map((projectPath) => ({ id: projectId(projectPath), path: projectPath }))];
+  const ownerForCwd = (cwd) => {
+    if (!cwd) return null;
+    return candidates.filter((project) => project.path !== os.homedir() && belongs(cwd, project.path)).sort((left, right) => right.path.length - left.path.length)[0] || null;
+  };
   const processProject = new Map();
   for (const process of processes) {
     const cwd = process.cwd || cwdByPid.get(process.pid);
-    const owner = projects.find((project) => belongs(cwd, project.path));
+    const owner = ownerForCwd(cwd);
     if (owner) processProject.set(process.pid, owner.id);
   }
-  for (const connection of connections) {
-    if (!processProject.has(connection.pid)) {
-      const cwd = cwdByPid.get(connection.pid) || await processCwd(connection.pid);
-      const owner = projects.find((project) => belongs(cwd, project.path));
-      if (owner) processProject.set(connection.pid, owner.id);
+  const ownerForPid = (pid, visited = new Set()) => {
+    if (!pid || visited.has(pid)) return null;
+    visited.add(pid);
+    if (processProject.has(pid)) return { id: processProject.get(pid) };
+    const process = processByPid.get(pid);
+    const cwdOwner = ownerForCwd(cwdByPid.get(pid) || process?.cwd);
+    if (cwdOwner) {
+      processProject.set(pid, cwdOwner.id);
+      return cwdOwner;
     }
+    return process?.ppid ? ownerForPid(process.ppid, visited) : null;
+  };
+  for (const process of processes) ownerForPid(process.pid);
+  for (const connection of connections) {
+    if (!processProject.has(connection.pid)) ownerForPid(connection.pid);
   }
 
-  const byProject = new Map(projects.map((project) => [project.id, { processes: [], ports: [] }]));
+  const byProject = new Map(candidates.map((project) => [project.id, { processes: [], ports: [] }]));
   for (const process of processes) {
     const owner = processProject.get(process.pid);
     if (owner && byProject.has(owner)) byProject.get(owner).processes.push(process);
@@ -355,7 +478,8 @@ async function runtimeSnapshot(projects) {
     const owner = processProject.get(connection.pid);
     if (owner && byProject.has(owner)) byProject.get(owner).ports.push({ ...connection, url: localUrl(connection.address, connection.port) });
   }
-  return { byProject, errors };
+  const unassignedPorts = connections.filter((connection) => !processProject.has(connection.pid)).map((connection) => ({ ...connection, url: localUrl(connection.address, connection.port) }));
+  return { byProject, errors, extraPaths: [...runtimePaths], unassignedPorts };
 }
 
 function uniquePortRows(rows) {
@@ -368,14 +492,33 @@ function uniquePortRows(rows) {
   });
 }
 
+function uniqueSocketRows(rows) {
+  const seen = new Set();
+  return rows.filter((row) => {
+    const key = `${row.pid || ''}:${row.port}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 async function scanState() {
   const config = await settings();
+  startAgentDiscovery();
   const previous = await storedState();
+  if (!agentInventory.size && Array.isArray(previous.agentInventory)) {
+    agentInventory = new Map(previous.agentInventory.filter((item) => item?.path).map((item) => [item.path, item]));
+    agentUnassignedPorts = Array.isArray(previous.agentUnassignedPorts) ? previous.agentUnassignedPorts : [];
+  }
   const metadata = await discoverProjects(config);
-  const { byProject, errors } = await runtimeSnapshot(metadata);
+  const runtime = await runtimeSnapshot(metadata);
+  const knownPaths = new Set(metadata.map((item) => item.path));
+  const runtimeProjects = await Promise.all(runtime.extraPaths.filter((projectPath) => !knownPaths.has(projectPath)).map((projectPath) => projectInfo(projectPath, {}, null, ['runtime'])));
+  const allMetadata = [...metadata, ...runtimeProjects];
+  const { byProject, errors = [], unassignedPorts: runtimeUnassignedPorts = [] } = runtime;
   const now = new Date().toISOString();
-  const nextStored = { projects: { ...(previous.projects || {}) } };
-  const projects = metadata.map((item) => {
+  const nextStored = { projects: { ...(previous.projects || {}) }, agentInventory: [...agentInventory.values()], agentUnassignedPorts };
+  const projects = allMetadata.map((item) => {
     const runtime = byProject.get(item.id) || { processes: [], ports: [] };
     const previousProject = previous.projects?.[item.id] || {};
     const livePorts = runtime.ports.map((row) => ({
@@ -388,23 +531,28 @@ async function scanState() {
       pid: row.pid,
       process: row.process,
     }));
-    const knownRows = [...item.configuredPorts, ...item.hintedPorts, ...(previousProject.ports || [])]
-      .map((row) => ({ ...row, running: false, url: localUrl(null, Number(row.port)) }));
+    const reportedRows = item.reportedPorts.map((row) => ({ ...row, url: row.url || localUrl(row.address, Number(row.port)) }));
+    const knownRows = [...reportedRows, ...item.configuredPorts, ...(previousProject.ports || [])]
+      .map((row) => ({ ...row, running: Boolean(row.running), url: row.url || localUrl(null, Number(row.port)) }));
     const ports = uniquePortRows([...livePorts, ...knownRows]);
-    const running = runtime.processes.length > 0 || livePorts.length > 0;
+    const running = runtime.processes.length > 0 || livePorts.length > 0 || item.agentStatus === 'running' || reportedRows.some((row) => row.running);
+    const exists = existsSync(item.path);
     if (running) nextStored.projects[item.id] = { ports: livePorts.map((row) => ({ port: row.port, protocol: row.protocol, source: 'last seen' })), lastSeen: now };
     return {
       id: item.id,
       name: item.name,
       path: item.path,
-      status: running ? 'running' : 'stopped',
+      status: running ? 'running' : exists ? 'stopped' : 'missing',
+      agents: item.agents,
+      sessionCount: item.sessionCount,
+      sources: item.sources,
       processCount: runtime.processes.length,
       processes: runtime.processes.slice(0, 80).map((process) => ({ ...process, cwd: process.cwd || null })),
       ports,
-      openUrl: item.openUrl || livePorts[0]?.url || null,
+      openUrl: item.openUrl || livePorts[0]?.url || reportedRows.find((row) => row.url)?.url || null,
       start: item.start,
       package: item.package,
-      lastSeen: running ? now : previousProject.lastSeen || null,
+      lastSeen: running ? now : item.agentLastSeen || previousProject.lastSeen || null,
     };
   });
   try {
@@ -418,12 +566,12 @@ async function scanState() {
     scanRoots: (config.scanRoots || []).map(absoluteFromApp),
     projects,
     availableAgents: await availableAgents(),
-    agentScan: lastAgentScan,
-    errors,
+    agentDiscovery,
+    agentScans: agentDiscovery.reports,
+    unassignedPorts: uniqueSocketRows([...agentUnassignedPorts, ...runtimeUnassignedPorts]),
+    errors: [...agentDiscovery.errors, ...errors],
   };
 }
-
-const agentPrompt = (root) => `You are running a read-only local developer-runtime scan for ${root}. Do not modify files, start processes, stop processes, inspect repository contents, or access secrets. Run at most these three commands: (1) lsof -nP -iTCP -sTCP:LISTEN, (2) ps -axo pid=,ppid=,comm=,args= and filter only common dev runtimes such as node, npm, pnpm, bun, python, java, docker, redis, postgres, mysql, (3) use lsof cwd only for the relevant dev-runtime PIDs if needed. Then immediately return a concise report with process, PID, port, and URL. Do not do any other investigation.`;
 
 function parseJsonLines(output) {
   return String(output || '').split('\n').map((line) => line.trim()).filter(Boolean).flatMap((line) => {
@@ -441,34 +589,6 @@ function extractAgentText(output) {
   return { events, text: messages.at(-1) || String(output || '').trim() };
 }
 
-async function runAgentScan() {
-  const config = await settings();
-  const root = absoluteFromApp(config.scanRoots?.[0] || '..');
-  const agents = await availableAgents();
-  const selected = config.preferredAgent && config.preferredAgent !== 'auto'
-    ? agents.find((agent) => agent.name === config.preferredAgent && agent.path)
-    : agents.find((agent) => agent.name === 'agenthud' && agent.path) || agents.find((agent) => agent.name === 'codex' && agent.path) || agents.find((agent) => agent.path);
-  if (!selected) {
-    lastAgentScan = { status: 'unavailable', message: '没有检测到 agenthud、codex、claude 或 opencode。', finishedAt: new Date().toISOString() };
-    return lastAgentScan;
-  }
-
-  const startedAt = new Date().toISOString();
-  let args;
-  if (selected.name === 'agenthud') args = ['follow', '--json', '--once'];
-  else if (selected.name === 'codex') args = ['exec', '--json', '--ephemeral', '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', root, agentPrompt(root)];
-  else if (selected.name === 'claude') args = ['-p', agentPrompt(root), '--output-format', 'text'];
-  else args = ['run', agentPrompt(root)];
-
-  try {
-    const result = await spawnFileText(selected.path, args, { cwd: root, timeout: 60000, env: agentEnvironment() });
-    const parsed = extractAgentText(result.stdout);
-    lastAgentScan = { status: 'ok', agent: selected.name, path: selected.path, startedAt, finishedAt: new Date().toISOString(), text: parsed.text.slice(-12000), eventCount: parsed.events.length };
-  } catch (error) {
-    lastAgentScan = { status: 'error', agent: selected.name, path: selected.path, startedAt, finishedAt: new Date().toISOString(), message: error.message, output: String(error.stdout || error.stderr || '').slice(-4000) };
-  }
-  return lastAgentScan;
-}
 
 async function startProject(id) {
   const state = await scanState();
@@ -501,7 +621,7 @@ const server = http.createServer(async (request, response) => {
   try {
     const url = new URL(request.url, `http://${request.headers.host || '127.0.0.1'}`);
     if (request.method === 'GET' && url.pathname === '/api/state') return send(response, 200, await scanState());
-    if (request.method === 'POST' && url.pathname === '/api/scan/agent') return send(response, 200, { agentScan: await runAgentScan(), state: await scanState() });
+    if (request.method === 'POST' && url.pathname === '/api/scan/agent') return send(response, 200, { agentDiscovery: await startAgentDiscovery(true), state: await scanState() });
     const startMatch = url.pathname.match(/^\/api\/projects\/([a-f0-9]+)\/start$/);
     if (request.method === 'POST' && startMatch) return send(response, 200, { started: await startProject(startMatch[1]) });
     if (request.method === 'GET' && url.pathname === '/api/health') return send(response, 200, { ok: true });
