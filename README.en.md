@@ -40,6 +40,17 @@ npm run build
 npm start
 ```
 
+## macOS App
+
+Build a double-clickable local `.app` without manually starting terminal services:
+
+```bash
+npm run app:macos
+open "release/Agent Runtime Dashboard.app"
+```
+
+The app starts its bundled Node service, displays the dashboard in a `WKWebView`, and cleans up the service when it exits. It still uses one dynamic loopback port bound to `127.0.0.1`, but the user does not need to find or start that port manually. The build contains a Node runtime for the current machine architecture and is an unsigned, not notarized local-development build.
+
 ## Configuration
 
 Add explicit projects in `config/settings.json` when needed:

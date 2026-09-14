@@ -12,8 +12,9 @@ const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const configPath = path.join(appRoot, 'config/settings.json');
 const stateDir = path.join(os.homedir(), '.agent-runtime-dashboard');
 const statePath = path.join(stateDir, 'state.json');
-const port = Number(process.env.PORT || 4317);
+const requestedPort = Number(process.env.PORT || 4317);
 const agentNames = ['codex', 'claude', 'opencode'];
+const activeAgentProcesses = new Set();
 let agentDiscovery = { status: 'idle', startedAt: null, finishedAt: null, reports: [], errors: [] };
 let agentInventory = new Map();
 let agentUnassignedPorts = [];
@@ -274,6 +275,7 @@ function execFileText(command, args, options = {}) {
 function spawnFileText(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd: options.cwd, env: options.env || process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+    activeAgentProcesses.add(child);
     let stdout = '';
     let stderr = '';
     let settled = false;
@@ -290,6 +292,7 @@ function spawnFileText(command, args, options = {}) {
     child.stdout.on('data', (chunk) => { stdout += chunk; });
     child.stderr.on('data', (chunk) => { stderr += chunk; });
     child.on('error', (error) => {
+      activeAgentProcesses.delete(child);
       clearTimeout(timeout);
       if (!settled) {
         settled = true;
@@ -299,6 +302,7 @@ function spawnFileText(command, args, options = {}) {
       }
     });
     child.on('close', (code, signal) => {
+      activeAgentProcesses.delete(child);
       clearTimeout(timeout);
       if (settled) return;
       settled = true;
@@ -535,7 +539,8 @@ async function scanState() {
     const knownRows = [...reportedRows, ...item.configuredPorts, ...(previousProject.ports || [])]
       .map((row) => ({ ...row, running: Boolean(row.running), url: row.url || localUrl(null, Number(row.port)) }));
     const ports = uniquePortRows([...livePorts, ...knownRows]);
-    const running = runtime.processes.length > 0 || livePorts.length > 0 || item.agentStatus === 'running' || reportedRows.some((row) => row.running);
+    // Agent status can be stale while a refresh is in flight; local runtime evidence is authoritative.
+    const running = runtime.processes.length > 0 || livePorts.length > 0;
     const exists = existsSync(item.path);
     if (running) nextStored.projects[item.id] = { ports: livePorts.map((row) => ({ port: row.port, protocol: row.protocol, source: 'last seen' })), lastSeen: now };
     return {
@@ -589,6 +594,35 @@ function extractAgentText(output) {
   return { events, text: messages.at(-1) || String(output || '').trim() };
 }
 
+const staticTypes = {
+  '.css': 'text/css; charset=utf-8',
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+};
+
+async function serveStatic(pathname, response) {
+  const staticRoot = path.join(appRoot, 'dist');
+  if (!existsSync(path.join(staticRoot, 'index.html'))) return false;
+  let decodedPath;
+  try { decodedPath = decodeURIComponent(pathname); } catch { return false; }
+  const relativePath = decodedPath === '/' ? 'index.html' : decodedPath.replace(/^\/+/, '');
+  if (!relativePath || relativePath.split('/').includes('..')) return false;
+  const filePath = path.resolve(staticRoot, relativePath);
+  if (filePath !== staticRoot && !filePath.startsWith(`${staticRoot}${path.sep}`)) return false;
+  try {
+    const body = await readFile(filePath);
+    const cacheControl = relativePath === 'index.html' ? 'no-cache' : 'public, max-age=31536000, immutable';
+    response.writeHead(200, { 'content-type': staticTypes[path.extname(filePath).toLowerCase()] || 'application/octet-stream', 'cache-control': cacheControl });
+    response.end(body);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 
 async function startProject(id) {
   const state = await scanState();
@@ -625,12 +659,27 @@ const server = http.createServer(async (request, response) => {
     const startMatch = url.pathname.match(/^\/api\/projects\/([a-f0-9]+)\/start$/);
     if (request.method === 'POST' && startMatch) return send(response, 200, { started: await startProject(startMatch[1]) });
     if (request.method === 'GET' && url.pathname === '/api/health') return send(response, 200, { ok: true });
+    if (request.method === 'GET' && await serveStatic(url.pathname, response)) return;
     send(response, 404, { error: 'Not found' });
   } catch (error) {
     send(response, 400, { error: error.message || 'Request failed' });
   }
 });
 
-server.listen(port, '127.0.0.1', () => {
-  console.log(`Agent Runtime API: http://127.0.0.1:${port}`);
+let shuttingDown = false;
+function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  for (const child of activeAgentProcesses) child.kill('SIGTERM');
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 1000).unref();
+}
+
+process.once('SIGINT', shutdown);
+process.once('SIGTERM', shutdown);
+
+server.listen(requestedPort, '127.0.0.1', () => {
+  const address = server.address();
+  const actualPort = typeof address === 'object' && address ? address.port : requestedPort;
+  console.log(`Agent Runtime API: http://127.0.0.1:${actualPort}`);
 });

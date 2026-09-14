@@ -40,6 +40,17 @@ npm run build
 npm start
 ```
 
+## macOS App
+
+无需手动启动终端服务，可以构建一个可双击打开的本机 `.app`：
+
+```bash
+npm run app:macos
+open "release/Agent Runtime Dashboard.app"
+```
+
+App 会自动启动打包在内部的 Node 服务，在 `WKWebView` 中显示仪表盘，并在退出时清理服务。它仍会使用一个仅绑定 `127.0.0.1` 的动态临时端口，但用户不需要手动查找或启动端口。该构建包含当前机器架构的 Node 运行时，是未签名、未公证的本地开发版本。
+
 ## 配置
 
 `config/settings.json` 可添加明确的项目配置：

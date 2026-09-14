@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "node server/dev.mjs",
     "build": "vite build",
+    "app:macos": "scripts/build-macos-app.sh",
     "check": "node server/check.mjs",
     "start": "node server/index.mjs"
   },
@@ -19,4 +20,3 @@
     "vite": "^7.0.0"
   }
 }
-
