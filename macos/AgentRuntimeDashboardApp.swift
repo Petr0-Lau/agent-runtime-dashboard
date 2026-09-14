@@ -18,10 +18,6 @@ final class AgentRuntimeDashboardApp: NSObject, NSApplicationDelegate, NSWindowD
         application.run()
     }
 
-    private func log(_ message: String) {
-        FileHandle.standardError.write(Data("[Agent Runtime Dashboard] \(message)\n".utf8))
-    }
-
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
 
@@ -66,9 +62,7 @@ final class AgentRuntimeDashboardApp: NSObject, NSApplicationDelegate, NSWindowD
         let appRoot = resourceURL.appendingPathComponent("app")
         let nodeURL = resourceURL.appendingPathComponent("node")
         let serverURL = appRoot.appendingPathComponent("server/index.mjs")
-        log("resource=\(resourceURL.path) node=\(nodeURL.path) server=\(serverURL.path)")
         guard FileManager.default.fileExists(atPath: nodeURL.path), FileManager.default.fileExists(atPath: serverURL.path) else {
-            log("missing bundled resource")
             showError("App 内缺少 Node 运行时或服务文件")
             return
         }
@@ -106,7 +100,6 @@ final class AgentRuntimeDashboardApp: NSObject, NSApplicationDelegate, NSWindowD
         }
         process.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
-                self?.log("server process terminated")
                 guard let self, !self.didLoadDashboard else { return }
                 self.showError("本地服务启动失败或已退出")
             }
@@ -115,9 +108,7 @@ final class AgentRuntimeDashboardApp: NSObject, NSApplicationDelegate, NSWindowD
         do {
             try process.run()
             serverProcess = process
-            log("server process started pid=\(process.processIdentifier)")
         } catch {
-            log("server process failed: \(error.localizedDescription)")
             showError("无法启动本地服务：\(error.localizedDescription)")
         }
     }
